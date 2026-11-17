@@ -1,0 +1,135 @@
+name: Publish to Winget
+
+# A release created with GITHUB_TOKEN (as in create_release_from_builds.yml) does not
+# fire `release` events for other workflows, so this hooks onto that workflow finishing.
+on:
+  workflow_run:
+    workflows: [ "CI + Create Release" ]
+    types: [ completed ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (without the leading 'v'). Defaults to the version in pubspec.yaml."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE_ID: Nutcake.ReCon
+
+jobs:
+  publish:
+    name: Publish to Winget
+    runs-on: windows-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+
+      - name: Resolve version and installer URL
+        id: meta
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $version = $env:INPUT_VERSION
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $line = Select-String -Path pubspec.yaml -Pattern '^version:\s*(.+)$' | Select-Object -First 1
+            $version = $line.Matches[0].Groups[1].Value.Trim()
+          }
+          $version = $version.TrimStart('v')
+          $url = "https://github.com/${{ github.repository }}/releases/download/v$version/ReCon-Windows-$version.zip"
+          Write-Host "Version: $version"
+          Write-Host "Installer URL: $url"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "url=$url" >> $env:GITHUB_OUTPUT
+
+      - name: Download installer and compute hash
+        id: hash
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'recon-windows.zip'
+          # The release asset can take a moment to become downloadable, so retry briefly.
+          for ($i = 1; $i -le 5; $i++) {
+            try {
+              Invoke-WebRequest -Uri '${{ steps.meta.outputs.url }}' -OutFile $out
+              break
+            } catch {
+              if ($i -eq 5) { throw }
+              Write-Host "Download failed (attempt $i), retrying in 15s..."
+              Start-Sleep -Seconds 15
+            }
+          }
+          $sha = (Get-FileHash -Path $out -Algorithm SHA256).Hash
+          Write-Host "SHA256: $sha"
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Install wingetcreate
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri 'https://aka.ms/wingetcreate/latest' -OutFile (Join-Path $env:RUNNER_TEMP 'wingetcreate.exe')
+
+      - name: Check whether package already exists in winget-pkgs
+        id: exists
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $id = $env:PACKAGE_ID
+          $path = "manifests/$($id.Substring(0,1).ToLower())/$($id.Replace('.', '/'))"
+          gh api "repos/microsoft/winget-pkgs/contents/$path" --silent 2>$null
+          $exists = ($LASTEXITCODE -eq 0)
+          $global:LASTEXITCODE = 0
+          Write-Host "Package exists: $exists"
+          "exists=$($exists.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
+      - name: Submit update to winget-pkgs
+        if: steps.exists.outputs.exists == 'true'
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          & (Join-Path $env:RUNNER_TEMP 'wingetcreate.exe') update $env:PACKAGE_ID `
+            --version '${{ steps.meta.outputs.version }}' `
+            --urls '${{ steps.meta.outputs.url }}' `
+            --release-notes-url 'https://github.com/${{ github.repository }}/releases/tag/v${{ steps.meta.outputs.version }}' `
+            --token $env:WINGET_TOKEN `
+            --submit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Submit new package to winget-pkgs
+        if: steps.exists.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          $outDir = Join-Path $env:RUNNER_TEMP 'winget-manifests'
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          $replacements = @{
+            '{{VERSION}}'          = '${{ steps.meta.outputs.version }}'
+            '{{INSTALLER_URL}}'    = '${{ steps.meta.outputs.url }}'
+            '{{INSTALLER_SHA256}}' = '${{ steps.hash.outputs.sha256 }}'
+            '{{RELEASE_DATE}}'     = (Get-Date -AsUTC -Format 'yyyy-MM-dd')
+          }
+
+          Get-ChildItem '.github/winget/*.yaml' | ForEach-Object {
+            $content = Get-Content $_.FullName -Raw
+            foreach ($key in $replacements.Keys) {
+              $content = $content.Replace($key, $replacements[$key])
+            }
+            Set-Content -Path (Join-Path $outDir $_.Name) -Value $content -NoNewline
+          }
+
+          Get-ChildItem $outDir | ForEach-Object {
+            Write-Host "----- $($_.Name) -----"
+            Get-Content $_.FullName
+          }
+
+          & (Join-Path $env:RUNNER_TEMP 'wingetcreate.exe') submit $outDir `
+            --prtitle "New package: $env:PACKAGE_ID version ${{ steps.meta.outputs.version }}" `
+            --token $env:WINGET_TOKEN
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

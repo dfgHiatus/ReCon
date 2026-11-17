@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+PackageIdentifier: Nutcake.ReCon
+PackageVersion: "{{VERSION}}"
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: ReCon.exe
+    PortableCommandAlias: recon
+Dependencies:
+  PackageDependencies:
+    - PackageIdentifier: Microsoft.VCRedist.2015+.x64
+ReleaseDate: "{{RELEASE_DATE}}"
+Installers:
+  - Architecture: x64
+    InstallerUrl: "{{INSTALLER_URL}}"
+    InstallerSha256: "{{INSTALLER_SHA256}}"
+ManifestType: installer
+ManifestVersion: 1.10.0

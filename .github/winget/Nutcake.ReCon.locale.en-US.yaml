@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+PackageIdentifier: Nutcake.ReCon
+PackageVersion: "{{VERSION}}"
+PackageLocale: en-US
+Publisher: Nutcake
+PublisherUrl: https://github.com/Nutcake
+PublisherSupportUrl: https://github.com/Nutcake/ReCon/issues
+PackageName: ReCon
+PackageUrl: https://github.com/Nutcake/ReCon
+License: GPL-3.0
+LicenseUrl: https://github.com/Nutcake/ReCon/blob/main/LICENSE.txt
+ShortDescription: A Resonite Contacts App
+Description: ReCon is a contacts and messaging app for Resonite, built with Flutter. It lets you chat with contacts and browse sessions, worlds and your inventory outside of the game.
+Moniker: recon
+Tags:
+  - resonite
+  - chat
+  - contacts
+  - messaging
+  - vr
+ReleaseNotesUrl: https://github.com/Nutcake/ReCon/releases/tag/v{{VERSION}}
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0
