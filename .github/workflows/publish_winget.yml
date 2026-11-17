@@ -12,12 +12,19 @@ on:
         description: "Version to publish (without the leading 'v'). Defaults to the version in pubspec.yaml."
         required: false
         type: string
+      dry_run:
+        description: "Build the manifests and upload them as an artifact, but do not open a PR on winget-pkgs."
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 env:
   PACKAGE_ID: Nutcake.ReCon
+  # Only this repository may submit to winget-pkgs. Runs anywhere else (forks, test repos) are always dry runs.
+  UPSTREAM_REPOSITORY: Nutcake/ReCon
 
 jobs:
   publish:
@@ -29,11 +36,12 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
-      - name: Resolve version and installer URL
+      - name: Resolve version, installer URL and dry-run mode
         id: meta
         shell: pwsh
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           $version = $env:INPUT_VERSION
           if ([string]::IsNullOrWhiteSpace($version)) {
@@ -42,10 +50,16 @@ jobs:
           }
           $version = $version.TrimStart('v')
           $url = "https://github.com/${{ github.repository }}/releases/download/v$version/ReCon-Windows-$version.zip"
+
+          # workflow_run has no inputs, so INPUT_DRY_RUN is empty there and only the repository check applies.
+          $dryRun = ($env:INPUT_DRY_RUN -eq 'true') -or ('${{ github.repository }}' -ne $env:UPSTREAM_REPOSITORY)
+
           Write-Host "Version: $version"
           Write-Host "Installer URL: $url"
+          Write-Host "Dry run: $dryRun"
           "version=$version" >> $env:GITHUB_OUTPUT
           "url=$url" >> $env:GITHUB_OUTPUT
+          "dry_run=$($dryRun.ToString().ToLower())" >> $env:GITHUB_OUTPUT
 
       - name: Download installer and compute hash
         id: hash
@@ -67,6 +81,15 @@ jobs:
           Write-Host "SHA256: $sha"
           "sha256=$sha" >> $env:GITHUB_OUTPUT
 
+          # Sanity check: the nested installer the manifest points at must be at the zip root.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($out)
+          try {
+            if (-not ($zip.Entries | Where-Object { $_.FullName -eq 'ReCon.exe' })) {
+              throw "ReCon.exe not found at the root of the Windows zip."
+            }
+          } finally { $zip.Dispose() }
+
       - name: Install wingetcreate
         shell: pwsh
         run: |
@@ -86,25 +109,31 @@ jobs:
           Write-Host "Package exists: $exists"
           "exists=$($exists.ToString().ToLower())" >> $env:GITHUB_OUTPUT
 
-      - name: Submit update to winget-pkgs
+      - name: Update existing package
         if: steps.exists.outputs.exists == 'true'
         shell: pwsh
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
-          & (Join-Path $env:RUNNER_TEMP 'wingetcreate.exe') update $env:PACKAGE_ID `
-            --version '${{ steps.meta.outputs.version }}' `
-            --urls '${{ steps.meta.outputs.url }}' `
-            --release-notes-url 'https://github.com/${{ github.repository }}/releases/tag/v${{ steps.meta.outputs.version }}' `
-            --token $env:WINGET_TOKEN `
-            --submit
+          $outDir = Join-Path $env:RUNNER_TEMP 'winget-manifests'
+          $wcArgs = @(
+            'update', $env:PACKAGE_ID,
+            '--version', '${{ steps.meta.outputs.version }}',
+            '--urls', '${{ steps.meta.outputs.url }}',
+            '--release-notes-url', 'https://github.com/${{ github.repository }}/releases/tag/v${{ steps.meta.outputs.version }}',
+            '--out', $outDir
+          )
+          if ('${{ steps.meta.outputs.dry_run }}' -ne 'true') {
+            $wcArgs += @('--token', $env:WINGET_TOKEN, '--submit')
+          } else {
+            Write-Host "Dry run: generating manifests only, not submitting."
+          }
+          & (Join-Path $env:RUNNER_TEMP 'wingetcreate.exe') @wcArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Submit new package to winget-pkgs
+      - name: Render manifests for new package
         if: steps.exists.outputs.exists != 'true'
         shell: pwsh
-        env:
-          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
           $outDir = Join-Path $env:RUNNER_TEMP 'winget-manifests'
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
@@ -124,12 +153,30 @@ jobs:
             Set-Content -Path (Join-Path $outDir $_.Name) -Value $content -NoNewline
           }
 
-          Get-ChildItem $outDir | ForEach-Object {
+          $leftover = Select-String -Path (Join-Path $outDir '*.yaml') -Pattern '\{\{[A-Z_0-9]+\}\}'
+          if ($leftover) { $leftover | ForEach-Object { Write-Host $_ }; throw "Unreplaced placeholders in manifests." }
+
+      - name: Show manifests
+        shell: pwsh
+        run: |
+          Get-ChildItem (Join-Path $env:RUNNER_TEMP 'winget-manifests') -Recurse -File | ForEach-Object {
             Write-Host "----- $($_.Name) -----"
             Get-Content $_.FullName
           }
 
-          & (Join-Path $env:RUNNER_TEMP 'wingetcreate.exe') submit $outDir `
+      - name: Upload manifests artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: winget-manifests-${{ steps.meta.outputs.version }}
+          path: ${{ runner.temp }}/winget-manifests
+
+      - name: Submit new package to winget-pkgs
+        if: steps.exists.outputs.exists != 'true' && steps.meta.outputs.dry_run != 'true'
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          & (Join-Path $env:RUNNER_TEMP 'wingetcreate.exe') submit (Join-Path $env:RUNNER_TEMP 'winget-manifests') `
             --prtitle "New package: $env:PACKAGE_ID version ${{ steps.meta.outputs.version }}" `
             --token $env:WINGET_TOKEN
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
